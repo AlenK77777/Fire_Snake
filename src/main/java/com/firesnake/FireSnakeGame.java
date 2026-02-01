@@ -1,6 +1,7 @@
 package com.firesnake;
 
 import javax.swing.*;
+import javax.sound.sampled.*;
 import java.awt.*;
 import java.awt.event.*;
 import java.awt.geom.*;
@@ -21,6 +22,7 @@ public class FireSnakeGame extends JPanel implements ActionListener, KeyListener
     private static final int BLOCK_SIZE = 20;
     private static final int NORMAL_DELAY = 1000 / 12; // 12 FPS
     private static final int SLOW_DELAY = 1000 / 6;    // 6 FPS (2x slower)
+    private static final int FAST_DELAY = 1000 / 24;   // 24 FPS (2x faster)
     private int currentDelay = NORMAL_DELAY;
     
     // Modern color palette
@@ -65,6 +67,13 @@ public class FireSnakeGame extends JPanel implements ActionListener, KeyListener
     private static final Color SHRINK_TARGET_COLOR = new Color(255, 50, 50);
     private static final Color SHRINK_TARGET_INNER = new Color(255, 150, 150);
     
+    // Speed target color (orange/yellow)
+    private static final Color SPEED_TARGET_COLOR = new Color(255, 150, 0);
+    private static final Color SPEED_TARGET_INNER = new Color(255, 220, 100);
+    
+    // Snake speed color (when sped up)
+    private static final Color SNAKE_FAST_COLOR = new Color(255, 180, 50); // Orange tint when fast
+    
     // Target types enum (SQUARE dangerous targets)
     private enum TargetType {
         COMMON(new Color(255, 200, 50), new Color(255, 255, 150), 1, "Common"),
@@ -102,6 +111,10 @@ public class FireSnakeGame extends JPanel implements ActionListener, KeyListener
     private int slowdownTimer = 0;
     private static final int SLOWDOWN_DURATION = 120; // 10 seconds at 12 FPS
     
+    // Speedup effect
+    private int speedupTimer = 0;
+    private static final int SPEEDUP_DURATION = 240; // 10 seconds at 24 FPS (double speed)
+    
     // Statistics
     private int totalShots;
     private int targetsHit;
@@ -125,12 +138,438 @@ public class FireSnakeGame extends JPanel implements ActionListener, KeyListener
     private ArrayList<Target> targets;
     private ArrayList<SlowTarget> slowTargets;
     private ArrayList<ShrinkTarget> shrinkTargets;
+    private ArrayList<SpeedTarget> speedTargets;
     private int targetSpawnTimer = 0;
     private static final int TARGET_SPAWN_INTERVAL = 60;
     private static final int BULLET_SPEED = 50;
     
     private Timer timer;
     private Random random;
+    
+    // Retro Sound Engine for 8-bit style sounds
+    private RetroSoundEngine soundEngine;
+    
+    // Sound/Music mute state
+    private boolean soundMuted = false;
+    
+    // Background music engine
+    private MusicEngine musicEngine;
+    
+    // Track snake length for music tempo increase (every 10 segments)
+    private int tempoLevel = 0;
+    
+    // Food timer (10 seconds to eat food or game over)
+    private int foodTimer = 0;
+    private static final int FOOD_TIME_LIMIT = 120; // 10 seconds at 12 FPS
+    
+    // Inner class for generating retro 8-bit style sounds
+    private class RetroSoundEngine {
+        private static final int SAMPLE_RATE = 44100;
+        
+        RetroSoundEngine() {}
+        
+        // Generate square wave (classic 8-bit sound)
+        private byte[] generateSquareWave(double frequency, int durationMs, double volume) {
+            int numSamples = (int)(SAMPLE_RATE * durationMs / 1000.0);
+            byte[] buffer = new byte[numSamples];
+            double period = SAMPLE_RATE / frequency;
+            
+            for (int i = 0; i < numSamples; i++) {
+                double phase = (i % period) / period;
+                byte value = (byte)(phase < 0.5 ? 127 * volume : -127 * volume);
+                // Apply simple envelope for decay
+                double envelope = 1.0 - ((double)i / numSamples);
+                buffer[i] = (byte)(value * envelope);
+            }
+            return buffer;
+        }
+        
+        // Generate noise (for explosions)
+        private byte[] generateNoise(int durationMs, double volume) {
+            int numSamples = (int)(SAMPLE_RATE * durationMs / 1000.0);
+            byte[] buffer = new byte[numSamples];
+            Random noiseRandom = new Random();
+            
+            for (int i = 0; i < numSamples; i++) {
+                // Apply decay envelope for explosion effect
+                double envelope = 1.0 - ((double)i / numSamples);
+                envelope = Math.pow(envelope, 0.5); // Faster decay
+                buffer[i] = (byte)(noiseRandom.nextInt(256) - 128 * volume * envelope);
+            }
+            return buffer;
+        }
+        
+        // Generate frequency sweep (for shooting sound)
+        private byte[] generateSweep(double startFreq, double endFreq, int durationMs, double volume) {
+            int numSamples = (int)(SAMPLE_RATE * durationMs / 1000.0);
+            byte[] buffer = new byte[numSamples];
+            
+            double phase = 0;
+            for (int i = 0; i < numSamples; i++) {
+                double progress = (double)i / numSamples;
+                double currentFreq = startFreq + (endFreq - startFreq) * progress;
+                double envelope = 1.0 - progress;
+                
+                phase += 2 * Math.PI * currentFreq / SAMPLE_RATE;
+                // Square wave
+                double value = Math.sin(phase) > 0 ? 127 : -127;
+                buffer[i] = (byte)(value * volume * envelope);
+            }
+            return buffer;
+        }
+        
+        private void playSound(byte[] buffer) {
+            if (soundMuted) return;
+            new Thread(() -> {
+                try {
+                    AudioFormat format = new AudioFormat(SAMPLE_RATE, 8, 1, true, false);
+                    DataLine.Info info = new DataLine.Info(SourceDataLine.class, format);
+                    SourceDataLine line = (SourceDataLine) AudioSystem.getLine(info);
+                    line.open(format);
+                    line.start();
+                    line.write(buffer, 0, buffer.length);
+                    line.drain();
+                    line.close();
+                } catch (Exception e) {
+                    // Silently ignore audio errors
+                }
+            }).start();
+        }
+        
+        // Shooting sound - high-pitched sweep down
+        void playShoot() {
+            if (soundMuted) return;
+            byte[] sound = generateSweep(1200, 400, 80, 0.5);
+            playSound(sound);
+        }
+        
+        // Explosion sound - noise burst with bass
+        void playExplosion() {
+            if (soundMuted) return;
+            int duration = 150;
+            byte[] noise = generateNoise(duration, 0.6);
+            byte[] bass = generateSquareWave(80, duration, 0.4);
+            
+            // Mix noise and bass
+            byte[] mixed = new byte[noise.length];
+            for (int i = 0; i < noise.length && i < bass.length; i++) {
+                mixed[i] = (byte)Math.max(-127, Math.min(127, (noise[i] + bass[i]) / 2));
+            }
+            playSound(mixed);
+        }
+        
+        // Collision/hit sound - short noise burst
+        void playHit() {
+            if (soundMuted) return;
+            byte[] sound = generateNoise(60, 0.4);
+            playSound(sound);
+        }
+        
+        // Power-up sound (for slow/speed effects)
+        void playPowerUp() {
+            if (soundMuted) return;
+            byte[] sound = generateSweep(300, 1000, 150, 0.4);
+            playSound(sound);
+        }
+        
+        // Shrink sound - descending tone
+        void playShrink() {
+            if (soundMuted) return;
+            byte[] sound = generateSweep(800, 200, 200, 0.5);
+            playSound(sound);
+        }
+        
+        // Game over sound
+        void playGameOver() {
+            if (soundMuted) return;
+            new Thread(() -> {
+                try {
+                    // Play descending tones
+                    byte[] tone1 = generateSquareWave(400, 150, 0.5);
+                    byte[] tone2 = generateSquareWave(300, 150, 0.5);
+                    byte[] tone3 = generateSquareWave(200, 300, 0.5);
+                    
+                    AudioFormat format = new AudioFormat(SAMPLE_RATE, 8, 1, true, false);
+                    DataLine.Info info = new DataLine.Info(SourceDataLine.class, format);
+                    SourceDataLine line = (SourceDataLine) AudioSystem.getLine(info);
+                    line.open(format);
+                    line.start();
+                    line.write(tone1, 0, tone1.length);
+                    line.write(tone2, 0, tone2.length);
+                    line.write(tone3, 0, tone3.length);
+                    line.drain();
+                    line.close();
+                } catch (Exception e) {
+                    // Silently ignore audio errors
+                }
+            }).start();
+        }
+        
+        // Food eaten sound - quick ascending blip
+        void playEat() {
+            if (soundMuted) return;
+            byte[] sound = generateSweep(500, 900, 50, 0.3);
+            playSound(sound);
+        }
+        
+        // Speed boost sound
+        void playSpeedUp() {
+            if (soundMuted) return;
+            byte[] sound = generateSweep(400, 1500, 200, 0.4);
+            playSound(sound);
+        }
+    }
+    
+    // Background music engine - generates looping 8-bit style music
+    private class MusicEngine {
+        private static final int SAMPLE_RATE = 44100;
+        private volatile boolean playing = false;
+        private volatile boolean isMenuMusic = true;
+        private Thread musicThread;
+        private SourceDataLine currentLine;
+        private volatile double tempoMultiplier = 1.0; // Speed multiplier for game music
+        
+        MusicEngine() {}
+        
+        void startMenuMusic() {
+            stopMusic();
+            isMenuMusic = true;
+            playing = true;
+            tempoMultiplier = 1.0;
+            musicThread = new Thread(this::playMenuLoop);
+            musicThread.start();
+        }
+        
+        void startGameMusic() {
+            stopMusic();
+            isMenuMusic = false;
+            playing = true;
+            tempoMultiplier = 1.0;
+            musicThread = new Thread(this::playGameLoop);
+            musicThread.start();
+        }
+        
+        void setTempoMultiplier(double multiplier) {
+            this.tempoMultiplier = Math.min(3.0, multiplier); // Cap at 3x speed
+        }
+        
+        double getTempoMultiplier() {
+            return tempoMultiplier;
+        }
+        
+        void stopMusic() {
+            playing = false;
+            if (currentLine != null) {
+                currentLine.stop();
+                currentLine.close();
+                currentLine = null;
+            }
+            if (musicThread != null) {
+                musicThread.interrupt();
+                musicThread = null;
+            }
+        }
+        
+        // Generate a note with proper envelope (attack, decay)
+        private byte[] generateNote(double frequency, int durationMs, double volume, String waveType) {
+            int numSamples = (int)(SAMPLE_RATE * durationMs / 1000.0);
+            byte[] buffer = new byte[numSamples];
+            double period = SAMPLE_RATE / frequency;
+            
+            int attackSamples = Math.min(numSamples / 10, (int)(SAMPLE_RATE * 0.01));
+            int releaseSamples = numSamples / 4;
+            
+            for (int i = 0; i < numSamples; i++) {
+                double phase = (i % period) / period;
+                double value = 0;
+                
+                switch (waveType) {
+                    case "square":
+                        value = phase < 0.5 ? 1 : -1;
+                        // Soften square wave a bit
+                        value *= 0.7;
+                        break;
+                    case "triangle":
+                        value = phase < 0.5 ? (4 * phase - 1) : (3 - 4 * phase);
+                        break;
+                    case "pulse25":
+                        value = phase < 0.25 ? 1 : -1;
+                        value *= 0.6;
+                        break;
+                    default:
+                        value = Math.sin(2 * Math.PI * phase);
+                }
+                
+                // Envelope
+                double env = 1.0;
+                if (i < attackSamples) {
+                    env = (double) i / attackSamples;
+                } else if (i > numSamples - releaseSamples) {
+                    env = (double)(numSamples - i) / releaseSamples;
+                }
+                
+                buffer[i] = (byte)(value * 50 * volume * env);
+            }
+            return buffer;
+        }
+        
+        private void playMenuLoop() {
+            try {
+                AudioFormat format = new AudioFormat(SAMPLE_RATE, 8, 1, true, false);
+                DataLine.Info info = new DataLine.Info(SourceDataLine.class, format);
+                currentLine = (SourceDataLine) AudioSystem.getLine(info);
+                currentLine.open(format);
+                currentLine.start();
+                
+                // Menu music - calm, mysterious melody (like classic game title screens)
+                // E minor pentatonic
+                double E3 = 164.81, G3 = 196.00, A3 = 220.00, B3 = 246.94, D4 = 293.66, E4 = 329.63;
+                
+                while (playing) {
+                    if (soundMuted) {
+                        Thread.sleep(100);
+                        continue;
+                    }
+                    
+                    // Gentle melody pattern
+                    int noteDur = 300;
+                    
+                    // Phrase 1
+                    playNote(E3, noteDur, 0.4, "triangle");
+                    playNote(G3, noteDur, 0.35, "triangle");
+                    playNote(A3, noteDur, 0.4, "triangle");
+                    playNote(G3, noteDur, 0.35, "triangle");
+                    
+                    // Phrase 2
+                    playNote(B3, noteDur, 0.4, "triangle");
+                    playNote(A3, noteDur, 0.35, "triangle");
+                    playNote(G3, noteDur, 0.4, "triangle");
+                    playNote(E3, noteDur * 2, 0.35, "triangle");
+                    
+                    // Phrase 3 - higher
+                    playNote(D4, noteDur, 0.35, "triangle");
+                    playNote(B3, noteDur, 0.3, "triangle");
+                    playNote(A3, noteDur, 0.35, "triangle");
+                    playNote(G3, noteDur * 2, 0.3, "triangle");
+                    
+                    // Rest
+                    Thread.sleep(400);
+                }
+                
+                currentLine.drain();
+                currentLine.close();
+            } catch (Exception e) {
+                // Silently ignore
+            }
+        }
+        
+        private void playNote(double freq, int duration, double volume, String waveType) {
+            if (!playing || soundMuted || currentLine == null) return;
+            byte[] note = generateNote(freq, duration, volume, waveType);
+            currentLine.write(note, 0, note.length);
+        }
+        
+        private void playGameLoop() {
+            try {
+                AudioFormat format = new AudioFormat(SAMPLE_RATE, 8, 1, true, false);
+                DataLine.Info info = new DataLine.Info(SourceDataLine.class, format);
+                currentLine = (SourceDataLine) AudioSystem.getLine(info);
+                currentLine.open(format);
+                currentLine.start();
+                
+                // Game music - catchy, upbeat melody inspired by classic games
+                // C major / A minor scale for a fun feel
+                double C4 = 261.63, D4 = 293.66, E4 = 329.63, F4 = 349.23;
+                double G4 = 392.00, A4 = 440.00, B4 = 493.88, C5 = 523.25;
+                double C3 = 130.81, E3 = 164.81, G3 = 196.00, A3 = 220.00;
+                
+                int measure = 0;
+                
+                while (playing) {
+                    if (soundMuted) {
+                        Thread.sleep(100);
+                        continue;
+                    }
+                    
+                    // Base note duration adjusted by tempo
+                    int baseNote = (int)(150 / tempoMultiplier);
+                    int halfNote = (int)(75 / tempoMultiplier);
+                    int longNote = (int)(300 / tempoMultiplier);
+                    
+                    measure++;
+                    
+                    // Main catchy melody (like classic arcade games)
+                    switch (measure % 4) {
+                        case 0:
+                            // Rising phrase
+                            playGameNote(C4, baseNote, 0.4, "pulse25");
+                            playGameNote(E4, halfNote, 0.35, "pulse25");
+                            playGameNote(G4, baseNote, 0.4, "pulse25");
+                            playGameNote(C5, longNote, 0.45, "pulse25");
+                            // Bass
+                            playGameNote(C3, baseNote, 0.5, "triangle");
+                            playGameNote(G3, baseNote, 0.45, "triangle");
+                            break;
+                            
+                        case 1:
+                            // Descending phrase  
+                            playGameNote(B4, halfNote, 0.35, "pulse25");
+                            playGameNote(G4, halfNote, 0.35, "pulse25");
+                            playGameNote(E4, baseNote, 0.4, "pulse25");
+                            playGameNote(D4, baseNote, 0.4, "pulse25");
+                            playGameNote(C4, longNote, 0.4, "pulse25");
+                            // Bass
+                            playGameNote(E3, baseNote, 0.5, "triangle");
+                            playGameNote(C3, baseNote, 0.45, "triangle");
+                            break;
+                            
+                        case 2:
+                            // Bounce pattern
+                            playGameNote(A4, halfNote, 0.4, "pulse25");
+                            playGameNote(E4, halfNote, 0.35, "pulse25");
+                            playGameNote(A4, halfNote, 0.4, "pulse25");
+                            playGameNote(E4, halfNote, 0.35, "pulse25");
+                            playGameNote(G4, baseNote, 0.4, "pulse25");
+                            playGameNote(F4, baseNote, 0.35, "pulse25");
+                            playGameNote(E4, baseNote, 0.4, "pulse25");
+                            // Bass
+                            playGameNote(A3, baseNote, 0.5, "triangle");
+                            playGameNote(E3, baseNote, 0.45, "triangle");
+                            break;
+                            
+                        case 3:
+                            // Resolution
+                            playGameNote(D4, baseNote, 0.4, "pulse25");
+                            playGameNote(E4, baseNote, 0.4, "pulse25");
+                            playGameNote(F4, halfNote, 0.35, "pulse25");
+                            playGameNote(G4, longNote, 0.45, "pulse25");
+                            // Short rest
+                            Thread.sleep((int)(100 / tempoMultiplier));
+                            // Final note
+                            playGameNote(C4, longNote, 0.4, "pulse25");
+                            // Bass
+                            playGameNote(G3, baseNote, 0.5, "triangle");
+                            playGameNote(C3, longNote, 0.5, "triangle");
+                            break;
+                    }
+                    
+                    // Small pause between measures
+                    Thread.sleep((int)(50 / tempoMultiplier));
+                }
+                
+                currentLine.drain();
+                currentLine.close();
+            } catch (Exception e) {
+                // Silently ignore
+            }
+        }
+        
+        private void playGameNote(double freq, int duration, double volume, String waveType) {
+            if (!playing || soundMuted || currentLine == null) return;
+            byte[] note = generateNote(freq, duration, volume, waveType);
+            currentLine.write(note, 0, note.length);
+        }
+    }
     
     // Star class for hyperspace effect - stars fly towards us from center
     private class Star {
@@ -285,6 +724,8 @@ public class FireSnakeGame extends JPanel implements ActionListener, KeyListener
         float maxLifetime;
         float pulse = 0;
         TargetType type;
+        int spawnDelay; // 3 second spawn delay where target is inactive and blinking
+        static final int SPAWN_DELAY_DURATION = 36; // 3 seconds at 12 FPS
         
         Target(int x, int y, TargetType type) {
             this.x = x;
@@ -293,10 +734,15 @@ public class FireSnakeGame extends JPanel implements ActionListener, KeyListener
             float baseLife = 60 + random.nextInt(61);
             this.maxLifetime = baseLife / (1 + type.ordinal() * 0.2f);
             this.lifetime = maxLifetime;
+            this.spawnDelay = SPAWN_DELAY_DURATION; // Start with spawn delay
         }
         
         void update() {
-            lifetime--;
+            if (spawnDelay > 0) {
+                spawnDelay--;
+            } else {
+                lifetime--;
+            }
             pulse += 0.2f + type.ordinal() * 0.05f;
         }
         
@@ -304,8 +750,23 @@ public class FireSnakeGame extends JPanel implements ActionListener, KeyListener
             return lifetime <= 0;
         }
         
+        boolean isActive() {
+            return spawnDelay <= 0; // Only dangerous when spawn delay is over
+        }
+        
         void draw(Graphics2D g2d) {
             float alpha = Math.min(1.0f, lifetime / 30.0f);
+            
+            // Blink effect during spawn delay (inactive period)
+            if (spawnDelay > 0) {
+                // Fast blinking - visible every other few frames
+                if ((spawnDelay / 3) % 2 == 0) {
+                    alpha *= 0.3f; // Very transparent when blinking off
+                } else {
+                    alpha *= 0.7f; // Semi-transparent when blinking on
+                }
+            }
+            
             float pulseScale = (float)(Math.sin(pulse) * 0.1 + 1);
             int size = (int)(BLOCK_SIZE * pulseScale);
             int offset = (BLOCK_SIZE - size) / 2;
@@ -326,7 +787,7 @@ public class FireSnakeGame extends JPanel implements ActionListener, KeyListener
             g2d.setPaint(targetGradient);
             g2d.fill(new RoundRectangle2D.Float(x + offset, y + offset, size, size, 4, 4));
             
-            // Draw X pattern (danger indicator)
+            // Draw X pattern (danger indicator) - only when active
             g2d.setColor(new Color(255, 255, 255, (int)(200 * alpha)));
             g2d.setStroke(new BasicStroke(2));
             int centerX = x + BLOCK_SIZE / 2;
@@ -497,6 +958,79 @@ public class FireSnakeGame extends JPanel implements ActionListener, KeyListener
         }
     }
     
+    // Speed Target class - DIAMOND shape (safe to pass, speeds up snake 2x for 10 seconds when shot)
+    private class SpeedTarget {
+        int x, y;
+        float lifetime;
+        float maxLifetime;
+        float pulse = 0;
+        
+        SpeedTarget(int x, int y) {
+            this.x = x;
+            this.y = y;
+            this.maxLifetime = 70 + random.nextInt(50);
+            this.lifetime = maxLifetime;
+        }
+        
+        void update() {
+            lifetime--;
+            pulse += 0.2f;
+        }
+        
+        boolean isDead() {
+            return lifetime <= 0;
+        }
+        
+        void draw(Graphics2D g2d) {
+            float alpha = Math.min(1.0f, lifetime / 30.0f);
+            float pulseScale = (float)(Math.sin(pulse) * 0.15 + 1);
+            int size = (int)(BLOCK_SIZE * pulseScale);
+            
+            int centerX = x + BLOCK_SIZE / 2;
+            int centerY = y + BLOCK_SIZE / 2;
+            int halfSize = size / 2;
+            
+            // Draw outer glow (diamond shape)
+            for (int i = 3; i > 0; i--) {
+                int glowSize = halfSize + i * 3;
+                int[] xPoints = {centerX, centerX + glowSize, centerX, centerX - glowSize};
+                int[] yPoints = {centerY - glowSize, centerY, centerY + glowSize, centerY};
+                g2d.setColor(new Color(SPEED_TARGET_COLOR.getRed(), SPEED_TARGET_COLOR.getGreen(), SPEED_TARGET_COLOR.getBlue(), (int)((25 - i * 6) * alpha)));
+                g2d.fillPolygon(xPoints, yPoints, 4);
+            }
+            
+            // Draw target DIAMOND
+            int[] xPoints = {centerX, centerX + halfSize, centerX, centerX - halfSize};
+            int[] yPoints = {centerY - halfSize, centerY, centerY + halfSize, centerY};
+            
+            GradientPaint targetGradient = new GradientPaint(
+                centerX, centerY - halfSize, new Color(SPEED_TARGET_INNER.getRed(), SPEED_TARGET_INNER.getGreen(), SPEED_TARGET_INNER.getBlue(), (int)(255 * alpha)),
+                centerX, centerY + halfSize, new Color(SPEED_TARGET_COLOR.getRed(), SPEED_TARGET_COLOR.getGreen(), SPEED_TARGET_COLOR.getBlue(), (int)(255 * alpha))
+            );
+            g2d.setPaint(targetGradient);
+            g2d.fillPolygon(xPoints, yPoints, 4);
+            
+            // Draw lightning bolt inside (speed indicator)
+            g2d.setColor(new Color(255, 255, 255, (int)(220 * alpha)));
+            g2d.setStroke(new BasicStroke(2));
+            // Simple lightning bolt shape
+            g2d.drawLine(centerX - 2, centerY - 5, centerX + 2, centerY - 1);
+            g2d.drawLine(centerX + 2, centerY - 1, centerX - 2, centerY + 1);
+            g2d.drawLine(centerX - 2, centerY + 1, centerX + 2, centerY + 5);
+            
+            // Draw "x2" text
+            g2d.setColor(new Color(255, 255, 255, (int)(150 * alpha)));
+            g2d.setFont(new Font("Arial", Font.BOLD, 8));
+            g2d.drawString("x2", x + 4, y - 2);
+            
+            // Draw lifetime bar
+            float lifePercent = lifetime / maxLifetime;
+            int barWidth = (int)(BLOCK_SIZE * lifePercent);
+            g2d.setColor(new Color(SPEED_TARGET_COLOR.getRed(), SPEED_TARGET_COLOR.getGreen(), SPEED_TARGET_COLOR.getBlue(), (int)(150 * alpha)));
+            g2d.fillRect(x, y + BLOCK_SIZE + 2, barWidth, 3);
+        }
+    }
+    
     public FireSnakeGame() {
         setPreferredSize(new Dimension(TOTAL_WIDTH, GAME_HEIGHT));
         setBackground(BACKGROUND_COLOR_1);
@@ -509,7 +1043,11 @@ public class FireSnakeGame extends JPanel implements ActionListener, KeyListener
         targets = new ArrayList<>();
         slowTargets = new ArrayList<>();
         shrinkTargets = new ArrayList<>();
+        speedTargets = new ArrayList<>();
         directionQueue = new LinkedList<>();
+        soundEngine = new RetroSoundEngine();
+        musicEngine = new MusicEngine();
+        musicEngine.startMenuMusic();
         
         // Initialize stars for hyperspace effect
         stars = new ArrayList<>();
@@ -541,9 +1079,15 @@ public class FireSnakeGame extends JPanel implements ActionListener, KeyListener
         targetsHit = 0;
         foodEaten = 0;
         slowdownTimer = 0;
+        speedupTimer = 0;
+        tempoLevel = 0;
+        foodTimer = FOOD_TIME_LIMIT;
         currentDelay = NORMAL_DELAY;
         if (timer != null) {
             timer.setDelay(currentDelay);
+        }
+        if (musicEngine != null) {
+            musicEngine.setTempoMultiplier(1.0);
         }
         
         gameOver = false;
@@ -554,6 +1098,7 @@ public class FireSnakeGame extends JPanel implements ActionListener, KeyListener
         targets.clear();
         slowTargets.clear();
         shrinkTargets.clear();
+        speedTargets.clear();
         targetSpawnTimer = 0;
     }
     
@@ -571,6 +1116,9 @@ public class FireSnakeGame extends JPanel implements ActionListener, KeyListener
                 }
             }
         } while (!validPosition);
+        
+        // Reset food timer
+        foodTimer = FOOD_TIME_LIMIT;
     }
     
     private void spawnParticles(int x, int y, int count, Color baseColor) {
@@ -590,7 +1138,7 @@ public class FireSnakeGame extends JPanel implements ActionListener, KeyListener
     }
     
     private void spawnTargets() {
-        int count = random.nextInt(6);
+        int count = random.nextInt(12) + 1; // Double the targets (1-12 instead of 0-5)
         
         for (int i = 0; i < count; i++) {
             int attempts = 0;
@@ -605,12 +1153,16 @@ public class FireSnakeGame extends JPanel implements ActionListener, KeyListener
             }
             
             if (validPosition) {
-                // 15% chance for slow target, 10% for shrink target, 75% for dangerous target
+                // 12% slow target, 25% shrink target (more frequent!), 13% speed target, 50% dangerous target
                 int roll = random.nextInt(100);
-                if (roll < 15) {
+                if (roll < 12) {
                     slowTargets.add(new SlowTarget(tx, ty));
-                } else if (roll < 25) {
+                } else if (roll < 37) {
+                    // 25% for shrink targets - much more frequent now!
                     shrinkTargets.add(new ShrinkTarget(tx, ty));
+                } else if (roll < 50) {
+                    // 13% for speed targets
+                    speedTargets.add(new SpeedTarget(tx, ty));
                 } else {
                     targets.add(new Target(tx, ty, getRandomTargetType()));
                 }
@@ -637,6 +1189,10 @@ public class FireSnakeGame extends JPanel implements ActionListener, KeyListener
             if (sht.x == tx && sht.y == ty) return false;
         }
         
+        for (SpeedTarget spt : speedTargets) {
+            if (spt.x == tx && spt.y == ty) return false;
+        }
+        
         return true;
     }
     
@@ -657,12 +1213,121 @@ public class FireSnakeGame extends JPanel implements ActionListener, KeyListener
         
         bullets.add(new Bullet(startX, startY, dirX, dirY));
         totalShots++;
+        soundEngine.playShoot();
     }
     
     private void activateSlowdown() {
         slowdownTimer = SLOWDOWN_DURATION;
+        speedupTimer = 0; // Cancel speedup if active
         currentDelay = SLOW_DELAY;
         timer.setDelay(currentDelay);
+        soundEngine.playPowerUp();
+    }
+    
+    private void activateSpeedup() {
+        speedupTimer = SPEEDUP_DURATION;
+        slowdownTimer = 0; // Cancel slowdown if active
+        currentDelay = FAST_DELAY;
+        timer.setDelay(currentDelay);
+        soundEngine.playSpeedUp();
+    }
+    
+    // Check if snake length crossed another 10-segment threshold and increase music tempo
+    private void checkMusicTempoIncrease() {
+        int newTempoLevel = snakeLength / 10; // Every 10 segments = new tempo level
+        if (newTempoLevel > tempoLevel) {
+            tempoLevel = newTempoLevel;
+            double newTempo = 1.0 + tempoLevel * 0.2; // Increase by 20% for each 10 segments
+            musicEngine.setTempoMultiplier(newTempo);
+        }
+    }
+    
+    // Helper method to check bullet collisions with all targets
+    // Returns true if bullet hit something and was removed
+    // Uses precise collision - bullet must actually overlap the target
+    private boolean checkBulletCollisions(Bullet b, int bulletIndex) {
+        // Precise collision radius - bullet (radius ~5) + target center tolerance
+        final float COLLISION_RADIUS = BLOCK_SIZE / 2 + 5; // Precise hit required
+        
+        // Check collision with dangerous targets (square)
+        for (int j = targets.size() - 1; j >= 0; j--) {
+            Target t = targets.get(j);
+            float distToTarget = (float) Math.sqrt(
+                Math.pow(b.x - (t.x + BLOCK_SIZE / 2), 2) +
+                Math.pow(b.y - (t.y + BLOCK_SIZE / 2), 2)
+            );
+            if (distToTarget < COLLISION_RADIUS) {
+                spawnParticles(t.x, t.y, 20, t.type.color);
+                soundEngine.playExplosion();
+                score += t.type.points;
+                snakeLength += t.type.points;
+                checkMusicTempoIncrease();
+                targetsHit++;
+                targets.remove(j);
+                bullets.remove(bulletIndex);
+                return true;
+            }
+        }
+        
+        // Check collision with slow targets (circle)
+        for (int j = slowTargets.size() - 1; j >= 0; j--) {
+            SlowTarget st = slowTargets.get(j);
+            float distToTarget = (float) Math.sqrt(
+                Math.pow(b.x - (st.x + BLOCK_SIZE / 2), 2) +
+                Math.pow(b.y - (st.y + BLOCK_SIZE / 2), 2)
+            );
+            if (distToTarget < COLLISION_RADIUS) {
+                spawnParticles(st.x, st.y, 20, SLOW_TARGET_COLOR);
+                soundEngine.playExplosion();
+                activateSlowdown();
+                targetsHit++;
+                slowTargets.remove(j);
+                bullets.remove(bulletIndex);
+                return true;
+            }
+        }
+        
+        // Check collision with shrink targets (triangle)
+        for (int j = shrinkTargets.size() - 1; j >= 0; j--) {
+            ShrinkTarget sht = shrinkTargets.get(j);
+            float distToTarget = (float) Math.sqrt(
+                Math.pow(b.x - (sht.x + BLOCK_SIZE / 2), 2) +
+                Math.pow(b.y - (sht.y + BLOCK_SIZE / 2), 2)
+            );
+            if (distToTarget < COLLISION_RADIUS) {
+                spawnParticles(sht.x, sht.y, 20, SHRINK_TARGET_COLOR);
+                soundEngine.playExplosion();
+                soundEngine.playShrink();
+                snakeLength = Math.max(1, snakeLength / 2);
+                while (snakeList.size() > snakeLength) {
+                    snakeList.remove(0);
+                }
+                targetsHit++;
+                shrinkTargets.remove(j);
+                bullets.remove(bulletIndex);
+                return true;
+            }
+        }
+        
+        // Check collision with speed targets (diamond)
+        for (int j = speedTargets.size() - 1; j >= 0; j--) {
+            SpeedTarget spt = speedTargets.get(j);
+            float distToTarget = (float) Math.sqrt(
+                Math.pow(b.x - (spt.x + BLOCK_SIZE / 2), 2) +
+                Math.pow(b.y - (spt.y + BLOCK_SIZE / 2), 2)
+            );
+            if (distToTarget < COLLISION_RADIUS) {
+                spawnParticles(spt.x, spt.y, 20, SPEED_TARGET_COLOR);
+                soundEngine.playExplosion();
+                activateSpeedup();
+                targetsHit++;
+                speedTargets.remove(j);
+                bullets.remove(bulletIndex);
+                return true;
+            }
+        }
+        
+        return false;
     }
     
     @Override
@@ -687,6 +1352,7 @@ public class FireSnakeGame extends JPanel implements ActionListener, KeyListener
             drawTargets(g2d);
             drawSlowTargets(g2d);
             drawShrinkTargets(g2d);
+            drawSpeedTargets(g2d);
             drawFood(g2d);
             drawSnake(g2d);
             drawBullets(g2d);
@@ -696,6 +1362,14 @@ public class FireSnakeGame extends JPanel implements ActionListener, KeyListener
             if (slowdownTimer > 0) {
                 drawSlowdownIndicator(g2d);
             }
+            
+            // Draw speedup indicator
+            if (speedupTimer > 0) {
+                drawSpeedupIndicator(g2d);
+            }
+            
+            // Always draw food timer during game
+            drawFoodTimer(g2d);
         }
         
         // Draw stats panel
@@ -728,8 +1402,15 @@ public class FireSnakeGame extends JPanel implements ActionListener, KeyListener
             g2d.drawLine(0, y, GAME_WIDTH, y);
         }
         
-        // Border color changes when slowed
-        Color borderColor = slowdownTimer > 0 ? SLOW_TARGET_COLOR : new Color(0, 255, 150);
+        // Border color changes when slowed or sped up
+        Color borderColor;
+        if (speedupTimer > 0) {
+            borderColor = SPEED_TARGET_COLOR;
+        } else if (slowdownTimer > 0) {
+            borderColor = SLOW_TARGET_COLOR;
+        } else {
+            borderColor = new Color(0, 255, 150);
+        }
         g2d.setColor(new Color(borderColor.getRed(), borderColor.getGreen(), borderColor.getBlue(), 100));
         g2d.setStroke(new BasicStroke(4));
         g2d.drawRect(2, 2, GAME_WIDTH - 4, GAME_HEIGHT - 4);
@@ -742,6 +1423,7 @@ public class FireSnakeGame extends JPanel implements ActionListener, KeyListener
     private void drawSnake(Graphics2D g2d) {
         int size = snakeList.size();
         boolean isSlowed = slowdownTimer > 0;
+        boolean isFast = speedupTimer > 0;
         
         for (int i = 0; i < size; i++) {
             int[] segment = snakeList.get(i);
@@ -749,12 +1431,25 @@ public class FireSnakeGame extends JPanel implements ActionListener, KeyListener
             
             Color segmentColor;
             if (i == size - 1) {
-                segmentColor = isSlowed ? SNAKE_SLOW_COLOR : SNAKE_HEAD_COLOR;
-                Color glowColor = isSlowed ? new Color(100, 150, 255, 80) : SNAKE_GLOW;
-                g2d.setColor(glowColor);
+                if (isFast) {
+                    segmentColor = SNAKE_FAST_COLOR;
+                    g2d.setColor(new Color(255, 180, 50, 80));
+                } else if (isSlowed) {
+                    segmentColor = SNAKE_SLOW_COLOR;
+                    g2d.setColor(new Color(100, 150, 255, 80));
+                } else {
+                    segmentColor = SNAKE_HEAD_COLOR;
+                    g2d.setColor(SNAKE_GLOW);
+                }
                 g2d.fill(new Ellipse2D.Float(segment[0] - 4, segment[1] - 4, BLOCK_SIZE + 8, BLOCK_SIZE + 8));
             } else {
-                if (isSlowed) {
+                if (isFast) {
+                    // Orange/yellow gradient when fast
+                    int r = (int)(255 + (200 - 255) * (1 - progress));
+                    int gr = (int)(180 + (100 - 180) * (1 - progress));
+                    int b = (int)(50 + (0 - 50) * (1 - progress));
+                    segmentColor = new Color(r, gr, b);
+                } else if (isSlowed) {
                     int r = (int)(150 + (100 - 150) * (1 - progress));
                     int gr = (int)(180 + (150 - 180) * (1 - progress));
                     int b = (int)(255 + (200 - 255) * (1 - progress));
@@ -853,6 +1548,12 @@ public class FireSnakeGame extends JPanel implements ActionListener, KeyListener
         }
     }
     
+    private void drawSpeedTargets(Graphics2D g2d) {
+        for (SpeedTarget spt : speedTargets) {
+            spt.draw(g2d);
+        }
+    }
+    
     private void drawBullets(Graphics2D g2d) {
         for (Bullet b : bullets) {
             b.draw(g2d);
@@ -887,6 +1588,75 @@ public class FireSnakeGame extends JPanel implements ActionListener, KeyListener
         g2d.drawString(text, barX + (barWidth - fm.stringWidth(text)) / 2, barY + barHeight + 14);
     }
     
+    private void drawSpeedupIndicator(Graphics2D g2d) {
+        // Draw speedup timer bar at top
+        float progress = (float) speedupTimer / SPEEDUP_DURATION;
+        int barWidth = (int)(GAME_WIDTH * 0.6f);
+        int barHeight = 8;
+        int barX = (GAME_WIDTH - barWidth) / 2;
+        int barY = 15;
+        
+        // Background
+        g2d.setColor(new Color(0, 0, 0, 150));
+        g2d.fillRoundRect(barX - 5, barY - 5, barWidth + 10, barHeight + 20, 10, 10);
+        
+        // Bar background
+        g2d.setColor(new Color(100, 50, 0));
+        g2d.fillRoundRect(barX, barY, barWidth, barHeight, 4, 4);
+        
+        // Bar fill (orange/yellow gradient effect)
+        g2d.setColor(SPEED_TARGET_COLOR);
+        g2d.fillRoundRect(barX, barY, (int)(barWidth * progress), barHeight, 4, 4);
+        
+        // Text
+        g2d.setColor(TEXT_COLOR);
+        g2d.setFont(new Font("Arial", Font.BOLD, 12));
+        String text = "SPEED x2 - " + String.format("%.1f", speedupTimer / 24.0f) + "s";
+        FontMetrics fm = g2d.getFontMetrics();
+        g2d.drawString(text, barX + (barWidth - fm.stringWidth(text)) / 2, barY + barHeight + 14);
+    }
+    
+    private void drawFoodTimer(Graphics2D g2d) {
+        // Draw food timer near the food
+        float timeLeft = foodTimer / 12.0f; // Convert to seconds
+        float progress = (float) foodTimer / FOOD_TIME_LIMIT;
+        
+        // Color changes from green to yellow to red based on time left
+        Color timerColor;
+        if (progress > 0.5f) {
+            timerColor = new Color(100, 255, 100); // Green
+        } else if (progress > 0.25f) {
+            timerColor = new Color(255, 255, 0); // Yellow
+        } else {
+            // Blink red when critical
+            int blink = (foodTimer % 12 < 6) ? 255 : 150;
+            timerColor = new Color(blink, 50, 50); // Red (blinking)
+        }
+        
+        // Draw circular timer around food
+        int timerRadius = BLOCK_SIZE + 8;
+        int centerX = foodX + BLOCK_SIZE / 2;
+        int centerY = foodY + BLOCK_SIZE / 2;
+        
+        // Background arc
+        g2d.setColor(new Color(50, 50, 50, 150));
+        g2d.setStroke(new BasicStroke(4));
+        g2d.drawOval(centerX - timerRadius, centerY - timerRadius, timerRadius * 2, timerRadius * 2);
+        
+        // Progress arc
+        g2d.setColor(timerColor);
+        g2d.setStroke(new BasicStroke(4));
+        int arcAngle = (int)(360 * progress);
+        g2d.drawArc(centerX - timerRadius, centerY - timerRadius, timerRadius * 2, timerRadius * 2, 90, -arcAngle);
+        
+        // Timer text
+        g2d.setFont(new Font("Arial", Font.BOLD, 10));
+        String timerText = String.format("%.1f", timeLeft);
+        FontMetrics fm = g2d.getFontMetrics();
+        g2d.setColor(timerColor);
+        g2d.drawString(timerText, centerX - fm.stringWidth(timerText) / 2, centerY - timerRadius - 5);
+    }
+    
     private void drawStatsPanel(Graphics2D g2d) {
         g2d.setColor(STATS_BG);
         g2d.fillRect(GAME_WIDTH, 0, STATS_WIDTH, GAME_HEIGHT);
@@ -919,7 +1689,7 @@ public class FireSnakeGame extends JPanel implements ActionListener, KeyListener
         // Divider
         g2d.setColor(new Color(100, 100, 150));
         g2d.drawLine(x, y - 5, GAME_WIDTH + STATS_WIDTH - 15, y - 5);
-        y += 5;
+        y += 12; // Added more spacing after divider
         
         // Shooting stats
         g2d.setColor(BULLET_COLOR);
@@ -948,7 +1718,7 @@ public class FireSnakeGame extends JPanel implements ActionListener, KeyListener
         // Divider
         g2d.setColor(new Color(100, 100, 150));
         g2d.drawLine(x, y - 5, GAME_WIDTH + STATS_WIDTH - 15, y - 5);
-        y += 5;
+        y += 12; // Added more spacing after divider
         
         // Eating stats
         g2d.setColor(FOOD_COLOR);
@@ -966,7 +1736,7 @@ public class FireSnakeGame extends JPanel implements ActionListener, KeyListener
         // Divider
         g2d.setColor(new Color(100, 100, 150));
         g2d.drawLine(x, y - 5, GAME_WIDTH + STATS_WIDTH - 15, y - 5);
-        y += 5;
+        y += 12; // Added more spacing after divider
         
         // Target legend
         g2d.setColor(new Color(255, 255, 255));
@@ -1001,6 +1771,15 @@ public class FireSnakeGame extends JPanel implements ActionListener, KeyListener
         g2d.fillPolygon(txPoints, tyPoints, 3);
         g2d.setColor(new Color(180, 180, 180));
         g2d.drawString("Shrink (/2)", x + 14, y);
+        y += 18;
+        
+        // Speed target (diamond)
+        g2d.setColor(SPEED_TARGET_COLOR);
+        int[] dxPoints = {x + 5, x + 10, x + 5, x};
+        int[] dyPoints = {y - 9, y - 4, y + 1, y - 4};
+        g2d.fillPolygon(dxPoints, dyPoints, 4);
+        g2d.setColor(new Color(180, 180, 180));
+        g2d.drawString("Speed (x2)", x + 14, y);
         y += lineHeight + 5;
         
         // Legend explanation
@@ -1008,7 +1787,7 @@ public class FireSnakeGame extends JPanel implements ActionListener, KeyListener
         g2d.setFont(new Font("Arial", Font.ITALIC, 10));
         g2d.drawString("Square = Dangerous", x, y);
         y += 14;
-        g2d.drawString("Circle/Triangle = Safe", x, y);
+        g2d.drawString("Other shapes = Safe", x, y);
         y += lineHeight;
         
         // Controls hint
@@ -1019,6 +1798,15 @@ public class FireSnakeGame extends JPanel implements ActionListener, KeyListener
         g2d.drawString("Arrows - Move", x, y);
         y += 14;
         g2d.drawString("Space - Shoot", x, y);
+        y += 14;
+        // Show mute status
+        if (soundMuted) {
+            g2d.setColor(new Color(255, 100, 100));
+            g2d.drawString("Backspace - Sound OFF", x, y);
+        } else {
+            g2d.setColor(new Color(100, 255, 100));
+            g2d.drawString("Backspace - Sound ON", x, y);
+        }
     }
     
     private void drawStartScreen(Graphics2D g2d) {
@@ -1053,12 +1841,25 @@ public class FireSnakeGame extends JPanel implements ActionListener, KeyListener
         g2d.setFont(new Font("Arial", Font.PLAIN, 16));
         String controls = "Arrows - Move | Space - Shoot | ESC - Exit";
         fm = g2d.getFontMetrics();
-        g2d.drawString(controls, (GAME_WIDTH - fm.stringWidth(controls)) / 2, GAME_HEIGHT - 80);
+        g2d.drawString(controls, (GAME_WIDTH - fm.stringWidth(controls)) / 2, GAME_HEIGHT - 100);
+        
+        // Sound control hint
+        if (soundMuted) {
+            g2d.setColor(new Color(255, 100, 100));
+            String soundHint = "Backspace - Sound OFF (press to enable)";
+            fm = g2d.getFontMetrics();
+            g2d.drawString(soundHint, (GAME_WIDTH - fm.stringWidth(soundHint)) / 2, GAME_HEIGHT - 75);
+        } else {
+            g2d.setColor(new Color(100, 255, 100));
+            String soundHint = "Backspace - Mute Sound";
+            fm = g2d.getFontMetrics();
+            g2d.drawString(soundHint, (GAME_WIDTH - fm.stringWidth(soundHint)) / 2, GAME_HEIGHT - 75);
+        }
         
         g2d.setColor(new Color(255, 100, 100, 200));
         String warning = "Don't collide with SQUARE targets!";
         fm = g2d.getFontMetrics();
-        g2d.drawString(warning, (GAME_WIDTH - fm.stringWidth(warning)) / 2, GAME_HEIGHT - 50);
+        g2d.drawString(warning, (GAME_WIDTH - fm.stringWidth(warning)) / 2, GAME_HEIGHT - 45);
     }
     
     private void drawGameOverScreen(Graphics2D g2d) {
@@ -1125,9 +1926,29 @@ public class FireSnakeGame extends JPanel implements ActionListener, KeyListener
             // Update slowdown timer
             if (slowdownTimer > 0) {
                 slowdownTimer--;
-                if (slowdownTimer == 0) {
+                if (slowdownTimer == 0 && speedupTimer == 0) {
                     currentDelay = NORMAL_DELAY;
                     timer.setDelay(currentDelay);
+                }
+            }
+            
+            // Update speedup timer
+            if (speedupTimer > 0) {
+                speedupTimer--;
+                if (speedupTimer == 0 && slowdownTimer == 0) {
+                    currentDelay = NORMAL_DELAY;
+                    timer.setDelay(currentDelay);
+                }
+            }
+            
+            // Update food timer - game over if time runs out
+            if (foodTimer > 0) {
+                foodTimer--;
+                if (foodTimer == 0) {
+                    spawnParticles(foodX, foodY, 25, FOOD_COLOR);
+                    soundEngine.playExplosion();
+                    endGame();
+                    return;
                 }
             }
             
@@ -1152,9 +1973,19 @@ public class FireSnakeGame extends JPanel implements ActionListener, KeyListener
                 sht.update();
             }
             
-            // Update bullets
+            speedTargets.removeIf(SpeedTarget::isDead);
+            for (SpeedTarget spt : speedTargets) {
+                spt.update();
+            }
+            
+            // Update bullets - check collision BEFORE and AFTER moving to fix close-range bug
             for (int i = bullets.size() - 1; i >= 0; i--) {
                 Bullet b = bullets.get(i);
+                
+                // Check collision BEFORE moving (point-blank shots)
+                boolean hitBeforeMove = checkBulletCollisions(b, i);
+                if (hitBeforeMove) continue;
+                
                 b.update();
                 
                 if (b.isOutOfBounds()) {
@@ -1168,23 +1999,28 @@ public class FireSnakeGame extends JPanel implements ActionListener, KeyListener
                     Math.pow(b.y - (foodY + BLOCK_SIZE / 2), 2)
                 );
                 if (distToFood < BLOCK_SIZE / 2 + 5) {
-                    spawnParticles(foodX, foodY, 15, FOOD_COLOR);
+                    spawnParticles(foodX, foodY, 25, FOOD_COLOR);
+                    soundEngine.playExplosion();
                     endGame();
                     break;
                 }
                 
                 // Check collision with dangerous targets (square)
+                // Precise collision - bullet must actually hit the target
                 boolean bulletHit = false;
+                final float COLLISION_RADIUS = BLOCK_SIZE / 2 + 5;
                 for (int j = targets.size() - 1; j >= 0; j--) {
                     Target t = targets.get(j);
                     float distToTarget = (float) Math.sqrt(
                         Math.pow(b.x - (t.x + BLOCK_SIZE / 2), 2) +
                         Math.pow(b.y - (t.y + BLOCK_SIZE / 2), 2)
                     );
-                    if (distToTarget < BLOCK_SIZE / 2 + 5) {
-                        spawnParticles(t.x, t.y, 15, t.type.color);
+                    if (distToTarget < COLLISION_RADIUS) {
+                        spawnParticles(t.x, t.y, 20, t.type.color);
+                        soundEngine.playExplosion();
                         score += t.type.points;
                         snakeLength += t.type.points;
+                        checkMusicTempoIncrease();
                         targetsHit++;
                         targets.remove(j);
                         bullets.remove(i);
@@ -1202,8 +2038,9 @@ public class FireSnakeGame extends JPanel implements ActionListener, KeyListener
                         Math.pow(b.x - (st.x + BLOCK_SIZE / 2), 2) +
                         Math.pow(b.y - (st.y + BLOCK_SIZE / 2), 2)
                     );
-                    if (distToTarget < BLOCK_SIZE / 2 + 5) {
-                        spawnParticles(st.x, st.y, 15, SLOW_TARGET_COLOR);
+                    if (distToTarget < COLLISION_RADIUS) {
+                        spawnParticles(st.x, st.y, 20, SLOW_TARGET_COLOR);
+                        soundEngine.playExplosion();
                         activateSlowdown();
                         targetsHit++;
                         slowTargets.remove(j);
@@ -1222,8 +2059,10 @@ public class FireSnakeGame extends JPanel implements ActionListener, KeyListener
                         Math.pow(b.x - (sht.x + BLOCK_SIZE / 2), 2) +
                         Math.pow(b.y - (sht.y + BLOCK_SIZE / 2), 2)
                     );
-                    if (distToTarget < BLOCK_SIZE / 2 + 5) {
-                        spawnParticles(sht.x, sht.y, 15, SHRINK_TARGET_COLOR);
+                    if (distToTarget < COLLISION_RADIUS) {
+                        spawnParticles(sht.x, sht.y, 20, SHRINK_TARGET_COLOR);
+                        soundEngine.playExplosion();
+                        soundEngine.playShrink();
                         // Shrink snake by half (minimum length 1)
                         snakeLength = Math.max(1, snakeLength / 2);
                         // Also remove excess segments from list
@@ -1232,6 +2071,27 @@ public class FireSnakeGame extends JPanel implements ActionListener, KeyListener
                         }
                         targetsHit++;
                         shrinkTargets.remove(j);
+                        bullets.remove(i);
+                        bulletHit = true;
+                        break;
+                    }
+                }
+                
+                if (bulletHit) continue;
+                
+                // Check collision with speed targets (diamond)
+                for (int j = speedTargets.size() - 1; j >= 0; j--) {
+                    SpeedTarget spt = speedTargets.get(j);
+                    float distToTarget = (float) Math.sqrt(
+                        Math.pow(b.x - (spt.x + BLOCK_SIZE / 2), 2) +
+                        Math.pow(b.y - (spt.y + BLOCK_SIZE / 2), 2)
+                    );
+                    if (distToTarget < COLLISION_RADIUS) {
+                        spawnParticles(spt.x, spt.y, 20, SPEED_TARGET_COLOR);
+                        soundEngine.playExplosion();
+                        activateSpeedup();
+                        targetsHit++;
+                        speedTargets.remove(j);
                         bullets.remove(i);
                         break;
                     }
@@ -1250,6 +2110,9 @@ public class FireSnakeGame extends JPanel implements ActionListener, KeyListener
             
             // Check wall collision
             if (x1 >= GAME_WIDTH || x1 < 0 || y1 >= GAME_HEIGHT || y1 < 0) {
+                spawnParticles(Math.max(0, Math.min(x1, GAME_WIDTH - BLOCK_SIZE)), 
+                              Math.max(0, Math.min(y1, GAME_HEIGHT - BLOCK_SIZE)), 20, SNAKE_HEAD_COLOR);
+                soundEngine.playHit();
                 endGame();
             }
             
@@ -1266,16 +2129,20 @@ public class FireSnakeGame extends JPanel implements ActionListener, KeyListener
                 // Check food collision
                 if (x1 == foodX && y1 == foodY) {
                     spawnParticles(foodX, foodY, 15, null);
+                    soundEngine.playEat();
                     spawnFood();
                     snakeLength++;
                     score++;
                     foodEaten++;
+                    checkMusicTempoIncrease();
                 }
                 
                 // Check dangerous target collision (square) - GAME OVER!
+                // Only active targets are dangerous (after 3 second spawn delay)
                 for (Target t : targets) {
-                    if (x1 == t.x && y1 == t.y) {
-                        spawnParticles(t.x, t.y, 20, t.type.color);
+                    if (t.isActive() && x1 == t.x && y1 == t.y) {
+                        spawnParticles(t.x, t.y, 25, t.type.color);
+                        soundEngine.playExplosion();
                         endGame();
                         break;
                     }
@@ -1287,6 +2154,8 @@ public class FireSnakeGame extends JPanel implements ActionListener, KeyListener
                 for (int i = 0; i < snakeList.size() - 1; i++) {
                     int[] segment = snakeList.get(i);
                     if (segment[0] == x1 && segment[1] == y1) {
+                        spawnParticles(x1, y1, 20, SNAKE_HEAD_COLOR);
+                        soundEngine.playHit();
                         endGame();
                         break;
                     }
@@ -1302,6 +2171,8 @@ public class FireSnakeGame extends JPanel implements ActionListener, KeyListener
         if (score > highScore) {
             highScore = score;
         }
+        soundEngine.playGameOver();
+        musicEngine.startMenuMusic(); // Switch back to menu music
     }
     
     private boolean isValidDirectionChange(int newXChange, int newYChange) {
@@ -1336,8 +2207,15 @@ public class FireSnakeGame extends JPanel implements ActionListener, KeyListener
     public void keyPressed(KeyEvent e) {
         int key = e.getKeyCode();
         
+        // Backspace toggles mute for all sounds and music
+        if (key == KeyEvent.VK_BACK_SPACE) {
+            soundMuted = !soundMuted;
+            return;
+        }
+        
         if (key == KeyEvent.VK_ESCAPE) {
             if (!gameStarted || gameClose) {
+                musicEngine.stopMusic();
                 System.exit(0);
             } else {
                 endGame();
@@ -1350,6 +2228,7 @@ public class FireSnakeGame extends JPanel implements ActionListener, KeyListener
                                  key == KeyEvent.VK_UP || key == KeyEvent.VK_DOWN;
             if (key == KeyEvent.VK_SPACE || isArrowKey) {
                 initGame();
+                musicEngine.startGameMusic(); // Switch to game music
                 if (isArrowKey) {
                     gameStarted = true;
                     if (key == KeyEvent.VK_LEFT) queueDirection(-BLOCK_SIZE, 0);
@@ -1364,6 +2243,7 @@ public class FireSnakeGame extends JPanel implements ActionListener, KeyListener
             
             if (!gameStarted && (isArrowKey || key == KeyEvent.VK_SPACE)) {
                 gameStarted = true;
+                musicEngine.startGameMusic(); // Switch to game music when starting
             }
             
             if (key == KeyEvent.VK_LEFT) {
